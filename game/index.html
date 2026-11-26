@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Merapi Ridge Run — Flight Game</title>
+<style>
+  html,body{margin:0;padding:0;background:#0b1e33;height:100%;overflow:hidden;
+    font-family:"Segoe UI",system-ui,-apple-system,Arial,sans-serif;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0b1e33;}
+  canvas{display:block;background:#87bfe8;max-width:100vw;max-height:100vh;
+    box-shadow:0 0 60px rgba(0,0,0,.6);}
+  #hint{position:fixed;left:10px;bottom:8px;color:rgba(255,255,255,.55);
+    font-size:12px;text-shadow:0 1px 2px #000;pointer-events:none;z-index:5;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="1280" height="720"></canvas></div>
+<div id="hint">W/S throttle &nbsp;·&nbsp; ↑/↓ climb &amp; descend &nbsp;·&nbsp; A/D or ←/→ steer &nbsp;·&nbsp; mouse steers too &nbsp;·&nbsp; R restart &nbsp;·&nbsp; P pause &nbsp;·&nbsp; M sound</div>
+<script>
+"use strict";
+/* Merapi Ridge Run — an original chase-view flight game.
+   Fly a small prop plane down a river valley between a volcano and
+   rice-field terraces, through glowing rings, and land on the runway.
+   Pure canvas 2D, no network, no assets: all art is drawn, all sound
+   is synthesised with WebAudio. */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = 1280, H = 720;
+
+/* ---------- deterministic RNG (so screenshots are reproducible) ---------- */
+function mulberry32(seed){let a=seed>>>0;return function(){a|=0;a=(a+0x6D2B79F5)|0;
+  let t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;
+  return((t^(t>>>14))>>>0)/4294967296;};}
+let rng = mulberry32(20261126);
+
+/* ---------- course definition ---------- */
+const COURSE_LEN = 12000;          // metres of valley to the runway
+const RING_Z = [900, 1900, 2900, 4000, 5100, 6300, 7600, 8900, 10100];
+const RINGS = RING_Z.map((z,i)=>{
+  const r = mulberry32(1000+i*77);
+  return { z, x: (r()-0.5)*560, alt: 900 + r()*1100, hit:false, passed:false };
+});
+const TOWERS = [ {z:2500,x:-260,h:520}, {z:4700,x:300,h:560}, {z:7000,x:-300,h:540},
+                 {z:9500,x:240,h:580}, {z:5800,x:0,h:480} ];
+const CLOUDS = [];
+for(let i=0;i<26;i++){ const r=mulberry32(500+i*31);
+  CLOUDS.push({x:r()*1600-160, y:40+r()*180, s:40+r()*90, v:6+r()*14, a:0.5+r()*0.4}); }
+const TREES = [];
+for(let i=0;i<140;i++){ const r=mulberry32(900+i*17);
+  TREES.push({z:r()*COURSE_LEN, x:(r()-0.5)*1400, s:0.7+r()*0.9}); }
+
+/* ---------- game state ---------- */
+const S = {
+  mode:"start",        // start | playing | crashed | landed | timeout
+  time:0, timeLeft:95, score:0, ringsHit:0,
+  z:0, x:0, alt:1400, speed:0, throttle:55, pitch:0, heading:0,
+  bank:0, prop:0, shake:0, msg:"", msgT:0, flash:0,
+  best:0, muted:false, paused:false, dist:0,
+};
+const keys = {};
+let mouseX = null, mouseActive = false;
+let audio = null, engineOsc=null, engineGain=null, windGain=null, windSrc=null;
+
+function reset(){
+  Object.assign(S,{mode:"playing",time:0,timeLeft:95,score:0,ringsHit:0,
+    z:0,x:0,alt:1400,speed:70,throttle:55,pitch:0,heading:0,bank:0,shake:0,
+    msg:"",msgT:0,flash:0,dist:0});
+  RINGS.forEach(r=>{r.hit=false;r.passed=false;});
+}
+function terrainHeight(x){
+  // Valley floor near the river, steep walls outside it.
+  const ax=Math.abs(x);
+  if(ax<420) return 0;
+  const t=(ax-420)/380;
+  return Math.min(2600, t*t*2600);
+}
+function crash(reason){
+  if(S.mode!=="playing")return;
+  S.mode="crashed"; S.crashReason=reason; S.shake=26; boom();
+}
+function land(){
+  if(S.mode!=="playing")return;
+  S.mode="landed"; S.score+=500; S.best=Math.max(S.best,S.score); chime(880); chime(1320);
+}
+function chime(freq){
+  if(!audio||S.muted)return;
+  try{
+    const o=audio.createOscillator(), g=audio.createGain();
+    o.type="sine"; o.frequency.value=freq;
+    g.gain.setValueAtTime(0.22,audio.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001,audio.currentTime+0.7);
+    o.connect(g).connect(audio.destination); o.start(); o.stop(audio.currentTime+0.75);
+  }catch(e){}
+}
+function boom(){
+  if(!audio||S.muted)return;
+  try{
+    const len=audio.sampleRate*0.6, buf=audio.createBuffer(1,len,audio.sampleRate),
+      d=buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*(1-i/len);
+    const src=audio.createBufferSource(); src.buffer=buf;
+    const g=audio.createGain(); g.gain.value=0.5;
+    src.connect(g).connect(audio.destination); src.start();
+  }catch(e){}
+}
+function ensureAudio(){
+  if(audio) return;
+  try{
+    audio=new (window.AudioContext||window.webkitAudioContext)();
+    engineOsc=audio.createOscillator(); engineOsc.type="sawtooth";
+    engineOsc.frequency.value=70;
+    const f=audio.createBiquadFilter(); f.type="lowpass"; f.frequency.value=420;
+    engineGain=audio.createGain(); engineGain.gain.value=0.0;
+    engineOsc.connect(f).connect(engineGain).connect(audio.destination);
+    engineOsc.start();
+    const len=audio.sampleRate*1, buf=audio.createBuffer(1,len,audio.sampleRate),
+      d=buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
+    windSrc=audio.createBufferSource(); windSrc.buffer=buf; windSrc.loop=true;
+    const wf=audio.createBiquadFilter(); wf.type="bandpass"; wf.frequency.value=600;
+    windGain=audio.createGain(); windGain.gain.value=0.0;
+    windSrc.connect(wf).connect(windGain).connect(audio.destination); windSrc.start();
+  }catch(e){ audio=null; }
+}
+
+/* ---------- input ---------- */
+addEventListener("keydown",e=>{
+  keys[e.key.toLowerCase()]=true;
+  if(["arrowup","arrowdown","arrowleft","arrowright"," "].includes(e.key.toLowerCase())) e.preventDefault();
+  ensureAudio(); if(audio&&audio.state==="suspended") audio.resume();
+  if(e.key==="Enter"||e.key===" "){
+    if(S.mode==="start"||S.mode==="crashed"||S.mode==="landed"||S.mode==="timeout") reset();
+  }
+  if(e.key.toLowerCase()==="r") reset();
+  if(e.key.toLowerCase()==="p"&&S.mode==="playing") S.paused=!S.paused;
+  if(e.key.toLowerCase()==="m"){ S.muted=!S.muted; }
+});
+addEventListener("keyup",e=>{ keys[e.key.toLowerCase()]=false; });
+canvas.addEventListener("mousemove",e=>{
+  const r=canvas.getBoundingClientRect();
+  mouseX=(e.clientX-r.left)/r.width*W; mouseActive=true;
+});
+canvas.addEventListener("mousedown",()=>{
+  ensureAudio(); if(audio&&audio.state==="suspended") audio.resume();
+  if(S.mode!=="playing") reset();
+});
+canvas.addEventListener("mouseleave",()=>{ mouseActive=false; });
+
+/* ---------- update ---------- */
+function update(dt){
+  S.time+=dt;
+  if(S.mode==="start"){ S.prop+=dt*30; return; }
+  if(S.mode!=="playing"){ S.prop+=dt*4; return; }
+  if(S.paused) return;
+  S.timeLeft-=dt;
+  if(S.timeLeft<=0){ S.timeLeft=0; S.mode="timeout"; S.best=Math.max(S.best,S.score); return; }
+
+  // throttle W/S
+  if(keys["w"]) S.throttle=Math.min(100,S.throttle+45*dt);
+  if(keys["s"]) S.throttle=Math.max(0,S.throttle-45*dt);
+  // pitch: Up climbs, Down descends
+  let pitchIn=0;
+  if(keys["arrowup"]) pitchIn=1;
+  if(keys["arrowdown"]) pitchIn=-1;
+  S.pitch += (pitchIn*0.9 - S.pitch)*Math.min(1,dt*4);
+  // steer: A/D or arrows, plus mouse
+  let steer=0;
+  if(keys["a"]||keys["arrowleft"]) steer-=1;
+  if(keys["d"]||keys["arrowright"]) steer+=1;
+  if(mouseActive&&mouseX!==null) steer += Math.max(-1,Math.min(1,(mouseX-W/2)/(W*0.28)));
+  steer=Math.max(-1.4,Math.min(1.4,steer));
+  S.bank += (steer*0.9 - S.bank)*Math.min(1,dt*5);
+  S.heading += steer*14*dt*(0.4+S.speed/180);
+  S.x += steer*S.speed*0.55*dt*1.6 + Math.sin(S.heading*Math.PI/180)*S.speed*dt*0.35;
+  S.x=Math.max(-900,Math.min(900,S.x));
+  // speed follows throttle; climb bleeds speed a little
+  const targetSpeed=55+S.throttle*1.35 - Math.max(0,S.pitch)*14;
+  S.speed += (targetSpeed-S.speed)*Math.min(1,dt*0.8);
+  S.alt += S.pitch*S.speed*0.55*dt*3.2;
+  S.alt=Math.max(60,Math.min(3200,S.alt));
+  S.z += S.speed*0.514*dt*3.4;      // knots -> m/s-ish, scaled for fun
+  S.dist=S.z;
+  S.prop+=dt*(8+S.throttle*0.35);
+  if(S.shake>0) S.shake=Math.max(0,S.shake-dt*30);
+  if(S.msgT>0) S.msgT-=dt;
+
+  // rings
+  for(const r of RINGS){
+    if(!r.passed && S.z>=r.z){
+      r.passed=true;
+      const dx=S.x-r.x, da=S.alt-r.alt;
+      if(Math.hypot(dx,da)<240){
+        r.hit=true; S.ringsHit++; S.score+=100; S.timeLeft+=6;
+        S.msg="RING! +100  ·  +6s"; S.msgT=1.6; chime(660); setTimeout(()=>chime(990),90);
+      } else { S.msg="ring missed"; S.msgT=1.2; }
+    }
+  }
+  // towers
+  for(const t of TOWERS){
+    if(Math.abs(S.z-t.z)<26 && Math.abs(S.x-t.x)<26 && S.alt<t.h+40){
+      crash("You clipped a ridge tower."); return;
+    }
+  }
+  // terrain
+  if(S.alt<=terrainHeight(S.x)+30){ crash("You hit the mountainside."); return; }
+  if(S.alt<420 && Math.abs(S.x)<420){ /* low over the river valley: warning only */ S.flash=0.12; }
+  // runway / course end
+  if(S.z>=COURSE_LEN){
+    if(S.alt<520 && S.speed<150) land();
+    else crash(S.alt>=520?"Too high over the runway — you overshot it.":"Too fast to land — you overshot the runway.");
+    return;
+  }
+  // audio
+  if(audio&&!S.muted){
+    engineOsc.frequency.value=55+S.throttle*1.1+S.speed*0.12;
+    engineGain.gain.value=0.05+S.throttle*0.0009;
+    windGain.gain.value=Math.min(0.12,S.speed*0.0006);
+  } else if(audio){ engineGain.gain.value=0; windGain.gain.value=0; }
+}
+
+/* ---------- drawing helpers ---------- */
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function skyGrad(){
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,"#2f6fb4"); g.addColorStop(0.42,"#7fb8e8");
+  g.addColorStop(0.55,"#cfe8f7"); g.addColorStop(0.56,"#e8d9a0"); g.addColorStop(1,"#5d8a4a");
+  return g;
+}
+function drawMountains(horizonY, headingDeg){
+  // Far ridge (blue haze), mid ridge, then Merapi cone with smoke.
+  const off=(headingDeg*6)%W;
+  const ridge=(base,amp,col,seed)=>{
+    ctx.fillStyle=col; ctx.beginPath(); ctx.moveTo(-20,horizonY+2);
+    for(let x=-20;x<=W+20;x+=40){
+      const r=mulberry32(seed+Math.floor((x+off)/40));
+      ctx.lineTo(x, horizonY - r()*amp - base);
+    }
+    ctx.lineTo(W+20,horizonY+2); ctx.closePath(); ctx.fill();
+  };
+  ridge(26,90,"#7d9cc4",11); ridge(10,64,"#5d84ad",23);
+  // Merapi volcano cone, left of centre, with a smoke plume
+  const mx=W*0.30 - (headingDeg*4)%60, my=horizonY;
+  ctx.fillStyle="#4a6b8a";
+  ctx.beginPath(); ctx.moveTo(mx-190,my+2); ctx.lineTo(mx-40,my-150);
+  ctx.lineTo(mx+10,my-168); ctx.lineTo(mx+60,my-150); ctx.lineTo(mx+200,my+2);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle="#e8eef2"; // snow cap
+  ctx.beginPath(); ctx.moveTo(mx-40,my-150); ctx.lineTo(mx+10,my-168);
+  ctx.lineTo(mx+60,my-150); ctx.lineTo(mx+34,my-128); ctx.lineTo(mx,my-140);
+  ctx.lineTo(mx-22,my-126); ctx.closePath(); ctx.fill();
+  ctx.fillStyle="rgba(230,230,225,0.85)"; // smoke
+  const t=S.time;
+  for(let i=0;i<4;i++){
+    const sy=my-170-((t*14+i*26)%110), sx=mx+10+Math.sin(t*0.7+i)*10+i*6;
+    ctx.beginPath(); ctx.ellipse(sx,sy,16+i*7,9+i*4,0,0,Math.PI*2); ctx.fill();
+  }
+  // Terraced hills on the right
+  ctx.fillStyle="#3f7040";
+  ctx.beginPath(); ctx.moveTo(W*0.72,horizonY+2);
+  ctx.lineTo(W*0.86,horizonY-84); ctx.lineTo(W*0.98,horizonY-40);
+  ctx.lineTo(W+20,horizonY+2); ctx.closePath(); ctx.fill();
+}
+function drawGround(horizonY){
+  // Valley floor: river winding down the middle, rice terraces either side.
+  const g=ctx.createLinearGradient(0,horizonY,0,H);
+  g.addColorStop(0,"#8fae62"); g.addColorStop(0.35,"#6da055"); g.addColorStop(1,"#3e7038");
+  ctx.fillStyle=g; ctx.fillRect(0,horizonY,W,H-horizonY);
+  const camZ=S.z, scroll=(camZ*0.9)%90;
+  // terrace bands scrolling toward the viewer
+  for(let i=0;i<9;i++){
+    const y=horizonY+8+Math.pow(i/9,1.7)*(H-horizonY-8);
+    const yy=y+scroll*0.4*(i/9);
+    const shade=i%2? "rgba(255,255,190,0.10)":"rgba(0,60,0,0.10)";
+    ctx.fillStyle=shade; ctx.fillRect(0,yy,W,7+i*2);
+    ctx.strokeStyle="rgba(30,70,20,0.35)"; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(0,yy); ctx.lineTo(W,yy); ctx.stroke();
+  }
+  // river: a winding blue band whose screen x follows the valley + heading
+  ctx.strokeStyle="#4f9fd8"; ctx.lineCap="round";
+  for(let wdt=0;wdt<3;wdt++){
+    ctx.lineWidth=26-wdt*8; ctx.globalAlpha=0.9-wdt*0.25;
+    ctx.beginPath();
+    for(let y=horizonY+4;y<=H;y+=14){
+      const depth=(y-horizonY)/(H-horizonY);
+      const cx=W/2 + Math.sin((camZ*0.02)+(y*0.012))*90*depth - S.heading*1.1*depth - S.x*0.35*depth;
+      if(y===horizonY+4) ctx.moveTo(cx,y); else ctx.lineTo(cx,y);
+    }
+    ctx.stroke();
+  }
+  ctx.globalAlpha=1;
+  // trees scrolling past
+  for(const tr of TREES){
+    const dz=tr.z-camZ; if(dz<0||dz>1600) continue;
+    const depth=1-dz/1600, y=horizonY+8+Math.pow(depth,1.6)*(H-horizonY-8);
+    const x=W/2+(tr.x-S.x)*0.55*depth - S.heading*1.4*depth;
+    const s=tr.s*(3+depth*16);
+    ctx.fillStyle="#1d4d1e";
+    ctx.beginPath(); ctx.moveTo(x,y-s); ctx.lineTo(x-s*0.55,y); ctx.lineTo(x+s*0.55,y);
+    ctx.closePath(); ctx.fill();
+  }
+  // ridge towers (red/white) ahead
+  for(const t of TOWERS){
+    const dz=t.z-camZ; if(dz<0||dz>2600) continue;
+    const depth=1-dz/2600, y=horizonY+6+Math.pow(depth,1.5)*(H-horizonY-6);
+    const x=W/2+(t.x-S.x)*0.6*depth - S.heading*1.6*depth;
+    const h=t.h*0.22*depth+8, wdt=Math.max(2,10*depth);
+    ctx.fillStyle="#c33"; ctx.fillRect(x-wdt/2,y-h,wdt,h);
+    ctx.fillStyle="#fff"; ctx.fillRect(x-wdt/2,y-h,wdt,h*0.4);
+    ctx.fillStyle="#c33"; ctx.beginPath(); ctx.arc(x,y-h,Math.max(2,5*depth),0,Math.PI*2); ctx.fill();
+  }
+}
+function drawRunway(horizonY){
+  const dz=COURSE_LEN-S.z; if(dz<0||dz>9000) return;
+  const depth=Math.max(0.02,1-dz/9000);
+  const topY=horizonY+6+Math.pow(depth,1.7)*(H-horizonY-10);
+  const wTop=8+depth*46, wBot=8+depth*260;
+  const cx=W/2 - S.x*0.5*depth - S.heading*1.8*depth;
+  ctx.fillStyle="#3a3f45";
+  ctx.beginPath();
+  ctx.moveTo(cx-wTop,topY); ctx.lineTo(cx+wTop,topY);
+  ctx.lineTo(cx+wBot,H); ctx.lineTo(cx-wBot,H); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle="#f5d90a"; ctx.lineWidth=Math.max(1,3*depth);
+  ctx.beginPath(); ctx.moveTo(cx-wTop,topY); ctx.lineTo(cx-wBot,H);
+  ctx.moveTo(cx+wTop,topY); ctx.lineTo(cx+wBot,H); ctx.stroke();
+  ctx.fillStyle="#fff";
+  for(let i=0;i<5;i++){
+    const f=i/5, y=topY+(H-topY)*f, wdt=(wTop+(wBot-wTop)*f)*0.16;
+    ctx.fillRect(cx-wdt/2,y, wdt, Math.max(1.5,10*f+2));
+  }
+  if(depth>0.25){
+    ctx.fillStyle="#ff5a3c"; ctx.font=`bold ${Math.round(13+depth*22)}px "Segoe UI",Arial`;
+    ctx.textAlign="center"; ctx.fillText("▲ RUNWAY 09", cx, topY-10);
+  }
+}
+function drawRings(horizonY){
+  const sorted=[...RINGS].sort((a,b)=>b.z-a.z);
+  for(const r of sorted){
+    const dz=r.z-S.z; if(dz<-40||dz>5200) continue;
+    const depth=Math.max(0.03,1-dz/5200);
+    const y=horizonY - (S.alt-r.alt)*0.16*depth - 40*depth + (H-horizonY)*0.12*depth;
+    const x=W/2 + (r.x-S.x)*0.85*depth - S.heading*2.0*depth;
+    const rad=34+depth*150;
+    ctx.save();
+    ctx.globalAlpha=0.35+0.65*depth;
+    ctx.strokeStyle=r.hit?"#37e08a":(r.passed?"#8899aa":"#ffd23e");
+    ctx.lineWidth=Math.max(2,10*depth);
+    ctx.shadowColor=r.hit?"#37e08a":"#ffd23e"; ctx.shadowBlur=22*depth;
+    ctx.beginPath(); ctx.ellipse(x,y,rad,rad*0.92,0,0,Math.PI*2); ctx.stroke();
+    ctx.shadowBlur=0; ctx.lineWidth=Math.max(1,3*depth);
+    ctx.strokeStyle="rgba(255,255,255,0.85)";
+    ctx.beginPath(); ctx.ellipse(x,y,rad*0.82,rad*0.75,0,0,Math.PI*2); ctx.stroke();
+    if(!r.passed&&depth>0.3){
+      ctx.fillStyle="#fff"; ctx.font=`bold ${Math.round(12+depth*14)}px "Segoe UI",Arial`;
+      ctx.textAlign="center"; ctx.fillText(`${Math.round(dz)} m`, x, y-rad-10);
+    }
+    ctx.restore();
+  }
+}
+function drawClouds(){
+  ctx.fillStyle="#fff";
+  for(const c of CLOUDS){
+    const x=((c.x - S.z*0.05 - S.heading*3)%(W+320)+(W+320))%(W+320)-160;
+    const y=c.y - S.alt*0.02;
+    ctx.globalAlpha=c.a;
+    ctx.beginPath();
+    ctx.ellipse(x,y,c.s,c.s*0.36,0,0,Math.PI*2);
+    ctx.ellipse(x+c.s*0.5,y+4,c.s*0.6,c.s*0.3,0,0,Math.PI*2);
+    ctx.ellipse(x-c.s*0.5,y+5,c.s*0.55,c.s*0.28,0,0,Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha=1;
+}
+function drawPlane(){
+  const px=W/2, py=H*0.66, bank=S.bank*0.5;
+  ctx.save();
+  ctx.translate(px,py); ctx.rotate(bank);
+  if(S.shake>0) ctx.translate((Math.random()-0.5)*S.shake,(Math.random()-0.5)*S.shake);
+  // shadow on the ground far below
+  // wings
+  ctx.fillStyle="#d23c2e";
+  ctx.beginPath(); ctx.moveTo(-150,6); ctx.lineTo(-34,-4); ctx.lineTo(34,-4); ctx.lineTo(150,6);
+  ctx.lineTo(120,20); ctx.lineTo(-120,20); ctx.closePath(); ctx.fill();
+  ctx.fillStyle="#f2f2f2";
+  ctx.beginPath(); ctx.moveTo(-150,6); ctx.lineTo(-120,20); ctx.lineTo(-96,16); ctx.lineTo(-128,4); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(150,6); ctx.lineTo(120,20); ctx.lineTo(96,16); ctx.lineTo(128,4); ctx.closePath(); ctx.fill();
+  // tail
+  ctx.fillStyle="#b03024";
+  ctx.beginPath(); ctx.moveTo(-52,26); ctx.lineTo(-86,52); ctx.lineTo(-58,56); ctx.lineTo(-30,32); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(52,26); ctx.lineTo(86,52); ctx.lineTo(58,56); ctx.lineTo(30,32); ctx.closePath(); ctx.fill();
+  ctx.fillStyle="#d23c2e";
+  ctx.beginPath(); ctx.moveTo(-16,18); ctx.lineTo(0,-16); ctx.lineTo(16,18); ctx.closePath(); ctx.fill();
+  // fuselage (rear view)
+  const fg=ctx.createLinearGradient(0,-30,0,44);
+  fg.addColorStop(0,"#f6f6f6"); fg.addColorStop(0.55,"#e8e2d2"); fg.addColorStop(1,"#9a938a");
+  ctx.fillStyle=fg;
+  ctx.beginPath(); ctx.ellipse(0,8,42,46,0,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle="#7a746c"; ctx.lineWidth=2; ctx.stroke();
+  // canopy
+  ctx.fillStyle="#274b6d";
+  ctx.beginPath(); ctx.ellipse(0,-16,26,16,0,Math.PI,0); ctx.closePath(); ctx.fill();
+  ctx.fillStyle="rgba(255,255,255,0.5)";
+  ctx.beginPath(); ctx.ellipse(-8,-20,10,5,-0.4,0,Math.PI*2); ctx.fill();
+  // prop blur + blades
+  ctx.save(); ctx.translate(0,8); ctx.rotate(S.prop);
+  ctx.fillStyle="rgba(40,40,40,0.35)";
+  ctx.beginPath(); ctx.ellipse(0,0,10,58,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="rgba(30,30,30,0.85)";
+  ctx.fillRect(-3,-58,6,116);
+  ctx.restore();
+  ctx.fillStyle="#222"; ctx.beginPath(); ctx.arc(0,8,7,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#ffd23e"; ctx.beginPath(); ctx.arc(0,8,3,0,Math.PI*2); ctx.fill();
+  // nav lights
+  const blink=Math.sin(S.time*6)>0;
+  if(blink){ ctx.fillStyle="#ff2e2e"; ctx.beginPath(); ctx.arc(-150,12,4,0,Math.PI*2); ctx.fill(); }
+  ctx.fillStyle="#2eff5a"; ctx.beginPath(); ctx.arc(150,12,4,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+function drawHUD(){
+  const pad=16;
+  // top bar
+  ctx.fillStyle="rgba(8,20,36,0.72)"; rr(pad,pad,W-pad*2,64,10); ctx.fill();
+  ctx.strokeStyle="rgba(120,220,255,0.5)"; ctx.lineWidth=1.5; ctx.stroke();
+  ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+  const items=[
+    ["SPEED", `${Math.round(S.speed)} kt`, "#7df3ff"],
+    ["ALTITUDE", `${Math.round(S.alt)} ft`, "#a5ff8a"],
+    ["HEADING", `${String(Math.round(((S.heading%360)+360)%360)).padStart(3,"0")}°`, "#ffd23e"],
+    ["SCORE", `${S.score}`, "#ffffff"],
+    ["RINGS", `${S.ringsHit} / ${RINGS.length}`, "#ffb3e6"],
+    ["TIME", `${Math.ceil(S.timeLeft)} s`, S.timeLeft<15?"#ff6a5a":"#ffffff"],
+  ];
+  const colW=(W-pad*2)/items.length;
+  items.forEach((it,i)=>{
+    const x=pad+18+i*colW;
+    ctx.fillStyle="#8fb8d8"; ctx.font="bold 11px 'Segoe UI',Arial"; ctx.fillText(it[0],x,pad+20);
+    ctx.fillStyle=it[2]; ctx.font="bold 24px 'Segoe UI',Arial"; ctx.fillText(it[1],x,pad+50);
+  });
+  // compass strip
+  ctx.fillStyle="rgba(8,20,36,0.6)"; rr(W/2-190,92,380,26,8); ctx.fill();
+  const hdg=((S.heading%360)+360)%360;
+  ctx.fillStyle="#cfe6ff"; ctx.font="bold 12px 'Segoe UI',Arial"; ctx.textAlign="center";
+  for(let d=-40;d<=40;d+=10){
+    const a=((Math.round(hdg/10)*10+d)%360+360)%360;
+    const x=W/2+d*4.4;
+    const label=a===0?"N":a===90?"E":a===180?"S":a===270?"W":String(a).padStart(3,"0");
+    ctx.fillText(label,x,110);
+  }
+  ctx.fillStyle="#ffd23e"; ctx.beginPath(); ctx.moveTo(W/2,92); ctx.lineTo(W/2-6,84); ctx.lineTo(W/2+6,84); ctx.closePath(); ctx.fill();
+  // throttle gauge (left)
+  ctx.fillStyle="rgba(8,20,36,0.6)"; rr(pad,H-190,44,150,8); ctx.fill();
+  ctx.fillStyle="#123"; ctx.fillRect(pad+14,H-168,16,106);
+  const th=S.throttle/100;
+  ctx.fillStyle=th>0.8?"#ff6a5a":th>0.4?"#ffd23e":"#37e08a";
+  ctx.fillRect(pad+14,H-168+106*(1-th),16,106*th);
+  ctx.fillStyle="#cfe6ff"; ctx.font="bold 10px 'Segoe UI',Arial"; ctx.textAlign="center";
+  ctx.fillText("THR",pad+22,H-176); ctx.fillText(Math.round(S.throttle)+"%",pad+22,H-28);
+  // altitude tape (right)
+  ctx.fillStyle="rgba(8,20,36,0.6)"; rr(W-pad-64,H-190,64,150,8); ctx.fill();
+  ctx.fillStyle="#a5ff8a"; ctx.font="bold 15px 'Segoe UI',Arial";
+  ctx.fillText(Math.round(S.alt),W-pad-32,H-112);
+  ctx.fillStyle="#8fb8d8"; ctx.font="bold 10px 'Segoe UI',Arial";
+  ctx.fillText("FEET",W-pad-32,H-96); ctx.fillText("ALT",W-pad-32,H-176);
+  // centre reticle
+  ctx.strokeStyle="rgba(255,255,255,0.8)"; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(W/2,H*0.42,18,0,Math.PI*2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(W/2-28,H*0.42); ctx.lineTo(W/2-10,H*0.42);
+  ctx.moveTo(W/2+10,H*0.42); ctx.lineTo(W/2+28,H*0.42);
+  ctx.moveTo(W/2,H*0.42-28); ctx.lineTo(W/2,H*0.42-10);
+  ctx.moveTo(W/2,H*0.42+10); ctx.lineTo(W/2,H*0.42+28); ctx.stroke();
+  // distance to runway
+  const remain=Math.max(0,Math.round(COURSE_LEN-S.z));
+  ctx.fillStyle="rgba(8,20,36,0.6)"; rr(W/2-110,H-58,220,34,8); ctx.fill();
+  ctx.fillStyle="#fff"; ctx.font="bold 15px 'Segoe UI',Arial"; ctx.textAlign="center";
+  ctx.fillText(`RUNWAY ${remain.toLocaleString()} m`,W/2,H-36);
+  // message
+  if(S.msgT>0){
+    ctx.fillStyle="#ffd23e"; ctx.font="bold 30px 'Segoe UI',Arial"; ctx.textAlign="center";
+    ctx.fillText(S.msg,W/2,H*0.30);
+  }
+  // low-altitude warning
+  if(S.flash>0||(S.mode==="playing"&&S.alt<420&&Math.abs(S.x)<420)){
+    ctx.fillStyle=`rgba(255,60,40,${0.25+0.2*Math.sin(S.time*10)})`;
+    ctx.fillRect(0,0,W,26);
+    ctx.fillStyle="#fff"; ctx.font="bold 15px 'Segoe UI',Arial"; ctx.textAlign="center";
+    ctx.fillText("⚠ PULL UP — TERRAIN",W/2,19);
+  }
+  if(S.paused){
+    ctx.fillStyle="rgba(0,0,0,0.55)"; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle="#fff"; ctx.font="bold 44px 'Segoe UI',Arial"; ctx.textAlign="center";
+    ctx.fillText("PAUSED",W/2,H/2);
+  }
+}
+function drawStart(){
+  ctx.fillStyle="rgba(6,16,30,0.55)"; ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd23e"; ctx.font="bold 64px 'Segoe UI',Arial";
+  ctx.fillText("MERAPI RIDGE RUN",W/2,190);
+  ctx.fillStyle="#fff"; ctx.font="bold 24px 'Segoe UI',Arial";
+  ctx.fillText("Fly the valley. Thread the rings. Land on Runway 09.",W/2,232);
+  ctx.fillStyle="#bfe3ff"; ctx.font="19px 'Segoe UI',Arial";
+  ctx.fillText("W / S — throttle      ↑ / ↓ — climb & descend",W/2,300);
+  ctx.fillText("A / D or ← / → — steer      mouse — steer too",W/2,330);
+  ctx.fillText("9 glowing rings · +100 pts & +6 s each · 95 s on the clock",W/2,360);
+  ctx.fillText("Mind the ridge towers and the valley walls — one hit ends the flight.",W/2,390);
+  const pulse=0.7+0.3*Math.sin(S.time*4);
+  ctx.globalAlpha=pulse; ctx.fillStyle="#37e08a"; ctx.font="bold 30px 'Segoe UI',Arial";
+  ctx.fillText("▶  PRESS ENTER OR CLICK TO FLY",W/2,470); ctx.globalAlpha=1;
+  ctx.fillStyle="rgba(255,255,255,0.75)"; ctx.font="15px 'Segoe UI',Arial";
+  ctx.fillText("An original game · Java, Indonesia · volcano, terraces & river below",W/2,530);
+}
+function drawEnd(){
+  const win=S.mode==="landed";
+  ctx.fillStyle="rgba(6,16,30,0.62)"; ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle=win?"#37e08a":"#ff6a5a"; ctx.font="bold 56px 'Segoe UI',Arial";
+  ctx.fillText(win?"✓ LANDED — RUNWAY 09":(S.mode==="timeout"?"⏱ TIME UP":"✕ CRASHED"),W/2,220);
+  ctx.fillStyle="#fff"; ctx.font="22px 'Segoe UI',Arial";
+  ctx.fillText(S.crashReason||(win?"Smooth touchdown at the foot of the volcano.":"The valley wins this time."),W/2,262);
+  ctx.fillStyle="#ffd23e"; ctx.font="bold 34px 'Segoe UI',Arial";
+  ctx.fillText(`SCORE  ${S.score}    ·    RINGS  ${S.ringsHit} / ${RINGS.length}`,W/2,330);
+  ctx.fillStyle="#bfe3ff"; ctx.font="19px 'Segoe UI',Arial";
+  ctx.fillText("Press R or ENTER to fly again",W/2,400);
+}
+function render(){
+  const horizonY=300 - S.pitch*60 - (S.alt-1400)*0.02;
+  ctx.fillStyle="#87bfe8"; ctx.fillRect(0,0,W,H);
+  ctx.save();
+  if(S.shake>0) ctx.translate((Math.random()-0.5)*S.shake,(Math.random()-0.5)*S.shake);
+  ctx.fillStyle=skyGrad(); ctx.fillRect(0,0,W,H);
+  // sun
+  ctx.fillStyle="#fff3c4"; ctx.beginPath(); ctx.arc(W*0.82,86,44,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#ffe98a"; ctx.beginPath(); ctx.arc(W*0.82,86,32,0,Math.PI*2); ctx.fill();
+  drawClouds();
+  drawMountains(horizonY,S.heading);
+  drawGround(horizonY);
+  drawRunway(horizonY);
+  drawRings(horizonY);
+  drawPlane();
+  ctx.restore();
+  drawHUD();
+  if(S.mode==="start") drawStart();
+  if(S.mode==="crashed"||S.mode==="landed"||S.mode==="timeout") drawEnd();
+}
+
+/* ---------- shot presets for screenshots (deterministic staging) ---------- */
+function applyShot(mode){
+  if(mode==="start"){ S.mode="start"; S.z=0; S.x=0; S.alt=1400; S.speed=70; S.throttle=55; S.heading=0; }
+  else if(mode==="play"){
+    reset(); S.z=3600; S.x=120; S.alt=1500; S.speed=132; S.throttle=72; S.heading=6;
+    S.score=200; S.ringsHit=2; S.timeLeft=78;
+    RINGS[0].hit=true; RINGS[0].passed=true; RINGS[1].hit=true; RINGS[1].passed=true;
+  }
+  else if(mode==="cover"){
+    reset(); S.z=2750; S.x=-60; S.alt=1250; S.speed=148; S.throttle=80; S.heading=-4;
+    S.score=300; S.ringsHit=3; S.timeLeft=71;
+    RINGS[0].hit=true; RINGS[0].passed=true; RINGS[1].hit=true; RINGS[1].passed=true;
+    RINGS[2].hit=true; RINGS[2].passed=true;
+  }
+  else if(mode==="end"){
+    reset(); S.mode="landed"; S.z=COURSE_LEN; S.x=0; S.alt=300; S.speed=95;
+    S.score=1400; S.ringsHit=9; S.timeLeft=22; S.crashReason="";
+    RINGS.forEach(r=>{r.hit=true;r.passed=true;});
+  }
+}
+const params=new URLSearchParams(location.search);
+if(params.get("shot")) applyShot(params.get("shot"));
+if(params.get("seed")) rng=mulberry32(Number(params.get("seed"))||1);
+
+/* test hook for the play-test harness */
+window.__merapi={ S, RINGS, reset, applyShot, COURSE_LEN };
+
+/* ---------- main loop ---------- */
+let last=performance.now();
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  update(dt); render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
